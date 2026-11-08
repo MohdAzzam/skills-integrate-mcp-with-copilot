@@ -5,11 +5,16 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
+from pydantic import BaseModel
 import os
 from pathlib import Path
+import secrets
+import time
+
+from .auth import TEACHERS_FILE, load_teachers, verify_password
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
@@ -18,6 +23,30 @@ app = FastAPI(title="Mergington High School API",
 current_dir = Path(__file__).parent
 app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
           "static")), name="static")
+
+SESSION_COOKIE_NAME = "teacher_session"
+SESSION_LIFETIME_SECONDS = 8 * 60 * 60
+COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "").lower() in {
+    "1", "true", "yes"
+}
+teachers = load_teachers(TEACHERS_FILE)
+sessions: dict[str, tuple[str, float]] = {}
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+def require_teacher(request: Request) -> str:
+    token = request.cookies.get(SESSION_COOKIE_NAME)
+    session = sessions.get(token) if token else None
+    if session is None or session[1] <= time.monotonic():
+        if token:
+            sessions.pop(token, None)
+        raise HTTPException(status_code=401, detail="Teacher login required")
+    return session[0]
+
 
 # In-memory activity database
 activities = {
@@ -89,7 +118,11 @@ def get_activities():
 
 
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
+def signup_for_activity(
+    activity_name: str,
+    email: str,
+    _teacher: str = Depends(require_teacher),
+):
     """Sign up a student for an activity"""
     # Validate activity exists
     if activity_name not in activities:
@@ -111,7 +144,11 @@ def signup_for_activity(activity_name: str, email: str):
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
+def unregister_from_activity(
+    activity_name: str,
+    email: str,
+    _teacher: str = Depends(require_teacher),
+):
     """Unregister a student from an activity"""
     # Validate activity exists
     if activity_name not in activities:
@@ -130,3 +167,56 @@ def unregister_from_activity(activity_name: str, email: str):
     # Remove student
     activity["participants"].remove(email)
     return {"message": f"Unregistered {email} from {activity_name}"}
+
+
+@app.post("/auth/login")
+def login(credentials: LoginRequest, response: Response):
+    teacher = next(
+        (teacher for teacher in teachers
+         if teacher["username"] == credentials.username),
+        None,
+    )
+    if teacher is None or not verify_password(
+        credentials.password, teacher["password_hash"]
+    ):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    token = secrets.token_urlsafe(32)
+    sessions[token] = (
+        teacher["username"],
+        time.monotonic() + SESSION_LIFETIME_SECONDS,
+    )
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=token,
+        max_age=SESSION_LIFETIME_SECONDS,
+        httponly=True,
+        secure=COOKIE_SECURE,
+        samesite="strict",
+        path="/",
+    )
+    return {"username": teacher["username"]}
+
+
+@app.get("/auth/me")
+def current_teacher(username: str = Depends(require_teacher)):
+    return {"username": username}
+
+
+@app.post("/auth/logout")
+def logout(
+    request: Request,
+    response: Response,
+    _teacher: str = Depends(require_teacher),
+):
+    token = request.cookies.get(SESSION_COOKIE_NAME)
+    if token:
+        sessions.pop(token, None)
+    response.delete_cookie(
+        key=SESSION_COOKIE_NAME,
+        secure=COOKIE_SECURE,
+        httponly=True,
+        samesite="strict",
+        path="/",
+    )
+    return {"message": "Logged out"}
